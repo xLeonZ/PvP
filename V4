@@ -1,0 +1,1680 @@
+-- Animal Simulator - Adaptive Fireball Universal v4 - Multi-Model Predictor
+-- F4 = Toggle GUI | V = Toggle Auto-Fire | N = Cycle aim point | F10 = Destroy
+-- Mobile + PC
+--
+-- V4 goals:
+-- * exactly 1.50s between fireballs
+-- * per-player adaptive movement model
+-- * dedicated ground / juke / coordinated-turn / fitted-circle / orbit / jump / flight models
+-- * ping + ping-jitter compensation
+-- * passive projectile speed calibration
+-- * passive DamageIndicatorEvent / projectile-contact feedback when the game exposes enough data
+--
+-- IMPORTANT: DamageIndicatorEvent is OBSERVED only. V4 never calls it to fake a hit.
+
+-- ===== Prevent duplicates =====
+for _, globalName in ipairs({"FireballAdaptiveV2", "FireballAdaptiveV3", "FireballAdaptiveV4"}) do
+    local old = _G[globalName]
+    if old then
+        for _, key in ipairs({
+            "InputConn", "AutoConn", "ProjectileConn", "DragConn", "DamageConn", "MainRemoteConn"
+        }) do
+            if old[key] then
+                pcall(function() old[key]:Disconnect() end)
+            end
+        end
+        if old.GUI then
+            pcall(function() old.GUI:Destroy() end)
+        end
+        _G[globalName] = nil
+    end
+end
+
+_G.FireballAdaptiveV4 = {}
+local STATE = _G.FireballAdaptiveV4
+
+-- ===== Services =====
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+local skillsFolder = ReplicatedStorage:WaitForChild("SkillsInRS", 5)
+if not skillsFolder then
+    warn("[AdaptiveFireball-V4] SkillsInRS not found.")
+    return
+end
+
+local remote = skillsFolder:WaitForChild("RemoteEvent", 5)
+if not remote then
+    warn("[AdaptiveFireball-V4] SkillsInRS.RemoteEvent not found.")
+    return
+end
+
+local damageIndicatorEvent = skillsFolder:FindFirstChild("DamageIndicatorEvent")
+
+-- ===== Config =====
+local COOLDOWN = 1.5
+local MAX_DISTANCE = 150
+
+-- Current Animal Simulator projectile speed is not publicly documented.
+-- V4 starts from the V3 seed and quickly self-calibrates if a visible projectile is detectable.
+local PROJECTILE_SPEED_SEED = 220
+local MIN_PROJECTILE_SPEED = 30
+local MAX_PROJECTILE_SPEED = 600
+
+-- Roblox ping is RTT. A remote target snapshot has already travelled server -> us and our
+-- FireServer call then travels us -> server. Exact Animal Simulator replication/interpolation
+-- is private, so this remains a heuristic and per-target residual learning corrects it.
+local NETWORK_RTT_FACTOR = 0.92
+local JITTER_LEAD_FACTOR = 0.30
+
+local SAMPLE_INTERVAL = 1 / 30
+local HISTORY_SECONDS = 1.45
+local SHORT_WINDOW = 0.13
+local LONG_WINDOW = 0.52
+local CIRCLE_FIT_WINDOW = 0.82
+local MAX_MODEL_HORIZON = 1.55
+local MAX_PLAUSIBLE_TARGET_SPEED = 420
+local MAX_ACCEL = 420
+local MIN_CIRCLE_RADIUS = 2.5
+local MAX_CIRCLE_RADIUS = 220
+local MIN_CIRCLE_ARC = math.rad(6)
+local MAX_CIRCLE_OMEGA = 10.0
+local MAX_VERTICAL_ACCEL = 360
+local MAX_SHOTS_KEPT = 24
+
+-- Auto Center is intentionally the default. It is more forgiving than feet/head across
+-- different Animal Simulator character shapes and during jumps/flying.
+local BODY_PARTS = {
+    {name = "Auto Center", part = "HumanoidRootPart", fallback = "HumanoidRootPart"},
+    {name = "Torso",      part = "HumanoidRootPart", fallback = "HumanoidRootPart"},
+    {name = "UpperTorso", part = "UpperTorso", fallback = "HumanoidRootPart"},
+    {name = "Head",       part = "Head", fallback = "HumanoidRootPart"},
+    {name = "Right Foot", part = "RightFoot", fallback = "HumanoidRootPart"},
+    {name = "Left Foot",  part = "LeftFoot", fallback = "HumanoidRootPart"},
+}
+
+local currentBodyPartIndex = 1
+local autoFire = false
+local targetName = ""
+local lastFire = -math.huge
+
+local projectileSpeedModel = PROJECTILE_SPEED_SEED
+local projectileCalibrationSamples = 0
+local smoothedPingMs = nil
+local pingJitterMs = 0
+
+local profiles = {}
+local shots = {}
+local damageDebugCount = 0
+local mainRemoteDebugCount = 0
+
+-- ===== Math helpers =====
+local ZERO = Vector3.new(0, 0, 0)
+
+local function clampMagnitude(v, maxMag)
+    local m = v.Magnitude
+    if m > maxMag and m > 0 then
+        return v.Unit * maxMag
+    end
+    return v
+end
+
+local function expAlpha(dt, tau)
+    if tau <= 0 then return 1 end
+    return 1 - math.exp(-dt / tau)
+end
+
+local function safeUnit(v)
+    local m = v.Magnitude
+    if m < 1e-5 then return ZERO end
+    return v / m
+end
+
+local function dotUnit(a, b)
+    local ua, ub = safeUnit(a), safeUnit(b)
+    if ua.Magnitude == 0 or ub.Magnitude == 0 then return 1 end
+    return math.clamp(ua:Dot(ub), -1, 1)
+end
+
+local function horizontal(v)
+    return Vector3.new(v.X, 0, v.Z)
+end
+
+local function signOf(x)
+    if x > 0 then return 1 end
+    if x < 0 then return -1 end
+    return 0
+end
+
+local function signedAngleXZ(a, b)
+    a, b = horizontal(a), horizontal(b)
+    if a.Magnitude < 1e-5 or b.Magnitude < 1e-5 then return 0 end
+    a, b = a.Unit, b.Unit
+    local cross = a.X * b.Z - a.Z * b.X
+    local dot = math.clamp(a:Dot(b), -1, 1)
+    return math.atan2(cross, dot)
+end
+
+local function rotateXZ(v, angle)
+    local c, s = math.cos(angle), math.sin(angle)
+    return Vector3.new(v.X * c - v.Z * s, v.Y, v.X * s + v.Z * c)
+end
+
+local function smoothstep01(x)
+    x = math.clamp(x, 0, 1)
+    return x * x * (3 - 2 * x)
+end
+
+local function solve3x3(a11,a12,a13,a21,a22,a23,a31,a32,a33,b1,b2,b3)
+    local det = a11*(a22*a33-a23*a32) - a12*(a21*a33-a23*a31) + a13*(a21*a32-a22*a31)
+    if math.abs(det) < 1e-7 then return nil end
+
+    local d1 = b1*(a22*a33-a23*a32) - a12*(b2*a33-a23*b3) + a13*(b2*a32-a22*b3)
+    local d2 = a11*(b2*a33-a23*b3) - b1*(a21*a33-a23*a31) + a13*(a21*b3-b2*a31)
+    local d3 = a11*(a22*b3-b2*a32) - a12*(a21*b3-b2*a31) + b1*(a21*a32-a22*a31)
+    return d1/det, d2/det, d3/det
+end
+
+-- ===== Character helpers =====
+local function isAlive(char)
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum ~= nil and hum.Health > 0
+end
+
+local function findPlayerByPartial(name)
+    if not name or name == "" then return nil end
+    local needle = string.lower(name)
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and (string.lower(p.Name) == needle or string.lower(p.DisplayName) == needle) then
+            return p
+        end
+    end
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            if string.find(string.lower(p.Name), needle, 1, true)
+                or string.find(string.lower(p.DisplayName), needle, 1, true) then
+                return p
+            end
+        end
+    end
+    return nil
+end
+
+local function getHRP(char)
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHumanoid(char)
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function getTargetPart(char)
+    if not char then return nil end
+    local cfg = BODY_PARTS[currentBodyPartIndex]
+    return char:FindFirstChild(cfg.part)
+        or char:FindFirstChild(cfg.fallback)
+        or char:FindFirstChild("HumanoidRootPart")
+end
+
+local function belongsToCharacter(part)
+    local node = part
+    for _ = 1, 6 do
+        if not node then break end
+        if node:IsA("Model") and node:FindFirstChildOfClass("Humanoid") then
+            return true
+        end
+        node = node.Parent
+    end
+    return false
+end
+
+local function getHumanoidState(hum)
+    if not hum then return nil end
+    local ok, state = pcall(function() return hum:GetState() end)
+    return ok and state or nil
+end
+
+local function raycastGround(char, origin)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local exclude = {}
+    if char then table.insert(exclude, char) end
+    if LocalPlayer.Character then table.insert(exclude, LocalPlayer.Character) end
+    params.FilterDescendantsInstances = exclude
+    params.IgnoreWater = false
+
+    local result = Workspace:Raycast(origin + Vector3.new(0, 2, 0), Vector3.new(0, -120, 0), params)
+    return result
+end
+
+-- ===== Ping / jitter =====
+local function getPingMs()
+    local ok, seconds = pcall(function() return LocalPlayer:GetNetworkPing() end)
+    if not ok or type(seconds) ~= "number" then
+        return smoothedPingMs or 0
+    end
+
+    local rawMs = math.max(0, seconds * 1000)
+    if not smoothedPingMs then
+        smoothedPingMs = rawMs
+        pingJitterMs = 0
+    else
+        local deviation = math.abs(rawMs - smoothedPingMs)
+        pingJitterMs += (deviation - pingJitterMs) * 0.12
+        smoothedPingMs += (rawMs - smoothedPingMs) * 0.22
+    end
+    return smoothedPingMs
+end
+
+-- ===== Per-player adaptive movement profile =====
+local function newProfile()
+    return {
+        samples = {},
+        lastSampleT = nil,
+
+        fastVel = ZERO,
+        slowVel = ZERO,
+        previousFastVel = ZERO,
+        accel = ZERO,
+        verticalAccelEMA = 0,
+
+        speedEMA = 0,
+        peakSpeed = 0,
+        turnRateEMA = 0,
+        signedTurnRateEMA = 0,
+        turnDirectionEMA = 0,
+        turnStabilityEMA = 0,
+        jukeEMA = 0,
+
+        circleCenter = nil,
+        circleRadius = 0,
+        circleOmega = 0,
+        circleRadialSpeed = 0,
+        circleConfidence = 0,
+        coordinatedTurnConfidence = 0,
+        orbitConfidence = 0,
+
+        jumpConfidence = 0,
+        flightConfidence = 0,
+        airborneTime = 0,
+        groundY = nil,
+        groundOffset = nil,
+        movementMode = "LEARNING",
+
+        leadBiasSeconds = 0,
+        lateralBias = ZERO,
+
+        shotsLearned = 0,
+        shotsFired = 0,
+        confirmedHits = 0,
+        probableHits = 0,
+        trackedMisses = 0,
+        ambiguousDamageEvents = 0,
+        lastHitSource = "none",
+    }
+end
+
+local function getProfile(player)
+    local id = player.UserId
+    if not profiles[id] then profiles[id] = newProfile() end
+    return profiles[id]
+end
+
+local function resetMotionProfile(p)
+    p.samples = {}
+    p.fastVel = ZERO
+    p.slowVel = ZERO
+    p.previousFastVel = ZERO
+    p.accel = ZERO
+    p.circleCenter = nil
+    p.circleRadius = 0
+    p.circleOmega = 0
+    p.circleRadialSpeed = 0
+    p.circleConfidence = 0
+    p.coordinatedTurnConfidence = 0
+    p.orbitConfidence = 0
+    p.jukeEMA = 0
+end
+
+local function regressionVelocity(samples, windowSeconds)
+    local n = #samples
+    if n < 2 then return ZERO end
+    local now = samples[n].t
+    local first = n
+    while first > 1 and (now - samples[first - 1].t) <= windowSeconds do
+        first -= 1
+    end
+    if n - first + 1 < 2 then return ZERO end
+
+    local meanT, meanP, weightSum = 0, ZERO, 0
+    for i = first, n do
+        local age = now - samples[i].t
+        local w = math.exp(-age / math.max(windowSeconds, 0.001))
+        meanT += samples[i].t * w
+        meanP += samples[i].pos * w
+        weightSum += w
+    end
+    if weightSum <= 0 then return ZERO end
+    meanT /= weightSum
+    meanP /= weightSum
+
+    local numerator, denominator = ZERO, 0
+    for i = first, n do
+        local age = now - samples[i].t
+        local w = math.exp(-age / math.max(windowSeconds, 0.001))
+        local dt = samples[i].t - meanT
+        numerator += (samples[i].pos - meanP) * (dt * w)
+        denominator += dt * dt * w
+    end
+    if denominator < 1e-7 then return ZERO end
+    return numerator / denominator
+end
+
+local function weightedSlope(values)
+    -- values = { {t=, v=, w=} ... }
+    if #values < 2 then return 0 end
+    local sw, mt, mv = 0, 0, 0
+    for _, q in ipairs(values) do
+        sw += q.w
+        mt += q.t * q.w
+        mv += q.v * q.w
+    end
+    if sw <= 0 then return 0 end
+    mt /= sw
+    mv /= sw
+    local num, den = 0, 0
+    for _, q in ipairs(values) do
+        local dt = q.t - mt
+        num += q.w * dt * (q.v - mv)
+        den += q.w * dt * dt
+    end
+    if den < 1e-8 then return 0 end
+    return num / den
+end
+
+-- Weighted least-squares circle fit over ALL recent XZ samples instead of V3's fragile
+-- three-point circumcircle. Also estimates angular velocity and radial drift (spirals).
+local function fitRecentCircle(profile)
+    local samples = profile.samples
+    local n = #samples
+    if n < 8 then return nil, 0, 0, 0, 0 end
+
+    local now = samples[n].t
+    local first = n
+    while first > 1 and (now - samples[first - 1].t) <= CIRCLE_FIT_WINDOW do
+        first -= 1
+    end
+    local count = n - first + 1
+    if count < 8 then return nil, 0, 0, 0, 0 end
+
+    local duration = samples[n].t - samples[first].t
+    if duration < 0.24 then return nil, 0, 0, 0, 0 end
+
+    local sw, mx, mz = 0, 0, 0
+    for i = first, n do
+        local age = now - samples[i].t
+        local w = math.exp(-age / 0.42)
+        sw += w
+        mx += samples[i].pos.X * w
+        mz += samples[i].pos.Z * w
+    end
+    if sw <= 0 then return nil, 0, 0, 0, 0 end
+    mx, mz = mx/sw, mz/sw
+
+    local suu,suv,svv,su,sv = 0,0,0,0,0
+    local bu,bv,b0 = 0,0,0
+    for i = first, n do
+        local age = now - samples[i].t
+        local w = math.exp(-age / 0.42)
+        local u = samples[i].pos.X - mx
+        local v = samples[i].pos.Z - mz
+        local q = u*u + v*v
+        suu += w*u*u
+        suv += w*u*v
+        svv += w*v*v
+        su += w*u
+        sv += w*v
+        bu += -w*u*q
+        bv += -w*v*q
+        b0 += -w*q
+    end
+
+    local D,E,F = solve3x3(suu,suv,su, suv,svv,sv, su,sv,sw, bu,bv,b0)
+    if not D then return nil,0,0,0,0 end
+
+    local cx = mx - D/2
+    local cz = mz - E/2
+    local radiusSq = (D*D + E*E)/4 - F
+    if radiusSq <= 0 then return nil,0,0,0,0 end
+    local radius = math.sqrt(radiusSq)
+    if radius < MIN_CIRCLE_RADIUS or radius > MAX_CIRCLE_RADIUS then
+        return nil,0,0,0,0
+    end
+
+    local angleValues, radiusValues = {}, {}
+    local totalResidual, maxResidual, weightResidual = 0, 0, 0
+    local prevRaw, unwrapped = nil, nil
+    local firstUnwrapped, lastUnwrapped = nil, nil
+
+    for i = first, n do
+        local pos = samples[i].pos
+        local dx, dz = pos.X-cx, pos.Z-cz
+        local r = math.sqrt(dx*dx + dz*dz)
+        local raw = math.atan2(dz, dx)
+        if prevRaw == nil then
+            unwrapped = raw
+            firstUnwrapped = raw
+        else
+            local diff = raw - prevRaw
+            while diff > math.pi do diff -= 2*math.pi end
+            while diff < -math.pi do diff += 2*math.pi end
+            unwrapped += diff
+        end
+        prevRaw = raw
+        lastUnwrapped = unwrapped
+
+        local age = now - samples[i].t
+        local w = math.exp(-age / 0.42)
+        table.insert(angleValues, {t=samples[i].t, v=unwrapped, w=w})
+        table.insert(radiusValues, {t=samples[i].t, v=r, w=w})
+
+        local err = math.abs(r-radius)
+        totalResidual += err*w
+        weightResidual += w
+        maxResidual = math.max(maxResidual, err)
+    end
+
+    local omega = weightedSlope(angleValues)
+    local radialSpeed = weightedSlope(radiusValues)
+    if math.abs(omega) > MAX_CIRCLE_OMEGA then return nil,0,0,0,0 end
+
+    local arc = math.abs((lastUnwrapped or 0) - (firstUnwrapped or 0))
+    local meanResidual = totalResidual / math.max(weightResidual, 1e-6)
+    local relativeResidual = meanResidual / math.max(radius,1)
+    local residualScore = math.clamp(1 - relativeResidual/0.10, 0, 1)
+    local worstScore = math.clamp(1 - (maxResidual/math.max(radius,1))/0.28, 0, 1)
+    local arcScore = math.clamp((arc-MIN_CIRCLE_ARC)/math.rad(42), 0, 1)
+
+    local directionMatches, directionTotal = 0, 0
+    for i=2,#angleValues do
+        local d = angleValues[i].v-angleValues[i-1].v
+        if math.abs(d) > math.rad(0.4) then
+            directionTotal += 1
+            if signOf(d) == signOf(omega) then directionMatches += 1 end
+        end
+    end
+    local directionScore = directionTotal > 0 and directionMatches/directionTotal or 0
+
+    local tangentialExpected = math.abs(omega)*radius
+    local measuredHorizontal = horizontal(profile.fastVel).Magnitude
+    local speedAgreement = 1 - math.clamp(math.abs(tangentialExpected-measuredHorizontal)/math.max(measuredHorizontal,12),0,1)
+    local radialPenalty = math.clamp(1 - math.abs(radialSpeed)/math.max(measuredHorizontal*0.65,10), 0.25, 1)
+
+    local confidence = residualScore*worstScore*(0.25+0.75*arcScore)*(0.25+0.75*directionScore)*(0.45+0.55*speedAgreement)*radialPenalty
+    confidence = math.clamp(confidence,0,1)
+
+    return Vector3.new(cx, samples[n].pos.Y, cz), radius, omega, radialSpeed, confidence
+end
+
+local function updateProfile(player, hrp)
+    local p = getProfile(player)
+    local now = os.clock()
+    if p.lastSampleT and now-p.lastSampleT < SAMPLE_INTERVAL then return p end
+
+    local dt = p.lastSampleT and (now-p.lastSampleT) or SAMPLE_INTERVAL
+    p.lastSampleT = now
+
+    -- Reset model after a teleport/respawn-sized discontinuity instead of poisoning history.
+    if #p.samples > 0 then
+        local prev = p.samples[#p.samples]
+        local stepDt = math.max(now-prev.t, 1/120)
+        local stepSpeed = (hrp.Position-prev.pos).Magnitude/stepDt
+        if stepSpeed > MAX_PLAUSIBLE_TARGET_SPEED*1.5 and (hrp.Position-prev.pos).Magnitude > 15 then
+            resetMotionProfile(p)
+        end
+    end
+
+    local char = player.Character
+    local hum = getHumanoid(char)
+    local state = getHumanoidState(hum)
+    local groundResult = raycastGround(char, hrp.Position)
+
+    table.insert(p.samples, {t=now, pos=hrp.Position, state=state})
+    while #p.samples > 2 and now-p.samples[1].t > HISTORY_SECONDS do
+        table.remove(p.samples,1)
+    end
+    if #p.samples < 3 then return p end
+
+    local fast = regressionVelocity(p.samples, SHORT_WINDOW)
+    local slow = regressionVelocity(p.samples, LONG_WINDOW)
+    if fast.Magnitude > MAX_PLAUSIBLE_TARGET_SPEED then fast = slow end
+    if slow.Magnitude > MAX_PLAUSIBLE_TARGET_SPEED then slow = clampMagnitude(slow,MAX_PLAUSIBLE_TARGET_SPEED) end
+
+    p.previousFastVel = p.fastVel
+    p.fastVel = fast
+    p.slowVel = slow
+
+    local speed = fast.Magnitude
+    p.speedEMA += (speed-p.speedEMA)*expAlpha(dt,0.18)
+    p.peakSpeed = math.max(speed,p.peakSpeed*math.exp(-dt/5.5))
+
+    local accelEstimate = (fast-slow)/math.max((LONG_WINDOW-SHORT_WINDOW)*0.5,0.05)
+    p.accel = clampMagnitude(p.accel:Lerp(accelEstimate,expAlpha(dt,0.15)),MAX_ACCEL)
+    p.verticalAccelEMA += (math.clamp(accelEstimate.Y,-MAX_VERTICAL_ACCEL,MAX_VERTICAL_ACCEL)-p.verticalAccelEMA)*expAlpha(dt,0.18)
+
+    -- Signed turning / coordinated-turn evidence.
+    local prevH, fastH = horizontal(p.previousFastVel), horizontal(fast)
+    local signedTurnRate = 0
+    if prevH.Magnitude > 4 and fastH.Magnitude > 4 then
+        signedTurnRate = math.clamp(signedAngleXZ(prevH,fastH)/math.max(dt,1/120),-MAX_CIRCLE_OMEGA,MAX_CIRCLE_OMEGA)
+    end
+    local turnRate = math.abs(signedTurnRate)
+    p.turnRateEMA += (turnRate-p.turnRateEMA)*expAlpha(dt,0.15)
+    p.signedTurnRateEMA += (signedTurnRate-p.signedTurnRateEMA)*expAlpha(dt,0.13)
+
+    local directionSample = math.abs(signedTurnRate)>0.10 and signOf(signedTurnRate) or 0
+    p.turnDirectionEMA += (directionSample-p.turnDirectionEMA)*expAlpha(dt,0.19)
+
+    local agreement = 0
+    if math.abs(p.signedTurnRateEMA)>0.08 and math.abs(signedTurnRate)>0.08 then
+        agreement = 1-math.clamp(math.abs(signedTurnRate-p.signedTurnRateEMA)/math.max(math.abs(p.signedTurnRateEMA),0.40),0,1)
+    end
+    p.turnStabilityEMA += (agreement-p.turnStabilityEMA)*expAlpha(dt,0.17)
+    p.coordinatedTurnConfidence = math.clamp(math.abs(p.turnDirectionEMA)*p.turnStabilityEMA*math.clamp(turnRate/0.45,0,1),0,1)
+
+    local fittedCenter,fittedRadius,fittedOmega,fittedRadial,fittedConfidence = fitRecentCircle(p)
+    if fittedCenter then
+        p.circleCenter = p.circleCenter and p.circleCenter:Lerp(fittedCenter,expAlpha(dt,0.13)) or fittedCenter
+        p.circleRadius += (fittedRadius-p.circleRadius)*expAlpha(dt,0.13)
+        p.circleOmega += (fittedOmega-p.circleOmega)*expAlpha(dt,0.12)
+        p.circleRadialSpeed += (fittedRadial-p.circleRadialSpeed)*expAlpha(dt,0.16)
+    end
+    local circleRaw = math.max(fittedConfidence,p.coordinatedTurnConfidence*0.60)
+    p.circleConfidence += (circleRaw-p.circleConfidence)*expAlpha(dt,0.16)
+
+    -- Stable turning is predictable; direction disagreement / reversals are jukes.
+    local dirMismatch = (1-dotUnit(fast,slow))*0.5
+    local velocityMismatch = (fast-slow).Magnitude/math.max(speed,12)
+    local turnFactor = math.clamp(p.turnRateEMA/7,0,1)
+    local rawJuke = math.clamp(dirMismatch*0.46 + math.clamp(velocityMismatch,0,1)*0.38 + turnFactor*0.16,0,1)
+    rawJuke *= 1-math.clamp(math.max(p.circleConfidence,p.coordinatedTurnConfidence)*0.82,0,0.82)
+    p.jukeEMA += (rawJuke-p.jukeEMA)*expAlpha(dt,0.20)
+
+    -- Ground clearance / jump / flight classification.
+    local gravity = math.max(Workspace.Gravity,1)
+    local groundY = groundResult and groundResult.Position.Y or nil
+    p.groundY = groundY
+
+    if groundY then
+        local rawOffset = hrp.Position.Y-groundY
+        local likelyGrounded = math.abs(fast.Y)<3.0 and rawOffset>0.25 and rawOffset<30
+        if likelyGrounded then
+            p.groundOffset = p.groundOffset and (p.groundOffset + (rawOffset-p.groundOffset)*expAlpha(dt,0.35)) or rawOffset
+        end
+    end
+
+    local baseOffset = p.groundOffset or 3
+    local aboveGround = groundY and (hrp.Position.Y-groundY-baseOffset) or 0
+    local stateJump = state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall
+    local stateFlying = state == Enum.HumanoidStateType.Flying
+    local gravityAgreement = 1-math.clamp(math.abs(p.verticalAccelEMA + gravity)/(gravity*0.75),0,1)
+    local airborne = stateJump or (groundY and aboveGround>1.6)
+
+    if airborne then p.airborneTime += dt else p.airborneTime = 0 end
+
+    local jumpRaw = 0
+    if stateJump then jumpRaw = 1
+    elseif airborne and gravityAgreement>0.45 and (math.abs(fast.Y)>2 or aboveGround>3) then
+        jumpRaw = 0.55 + 0.35*gravityAgreement
+    end
+
+    local flightRaw = 0
+    if stateFlying then
+        flightRaw = 1
+    elseif groundY and aboveGround>6 and p.airborneTime>0.22 then
+        local antiGravity = 1-gravityAgreement
+        local hoverOrControlled = math.clamp((antiGravity-0.25)/0.55,0,1)
+        local sustained = math.clamp((p.airborneTime-0.20)/0.45,0,1)
+        flightRaw = hoverOrControlled*(0.45+0.55*sustained)
+    end
+
+    if flightRaw>0.45 then jumpRaw *= 0.20 end
+    p.jumpConfidence += (jumpRaw-p.jumpConfidence)*expAlpha(dt,0.12)
+    p.flightConfidence += (flightRaw-p.flightConfidence)*expAlpha(dt,0.16)
+
+    return p
+end
+
+-- ===== Multi-model prediction =====
+local function predictLinearXZ(profile,currentPos,horizon)
+    local juke = math.clamp(profile.jukeEMA,0,1)
+    local fastH,slowH = horizontal(profile.fastVel),horizontal(profile.slowVel)
+    local blend = 0.16+juke*0.68
+    local v = fastH:Lerp(slowH,blend)
+    local a = horizontal(profile.accel)
+    local accelWeight = (1-juke)^2
+    local at = math.min(horizon,0.55)
+    local p = horizontal(currentPos) + v*horizon + a*(0.5*at*at*accelWeight)
+    p += horizontal(profile.lateralBias)*math.clamp(horizon/0.40,0,1)
+    return p
+end
+
+local function predictCoordinatedTurnXZ(profile,currentPos,horizon)
+    local v = horizontal(profile.fastVel)
+    local omega = profile.signedTurnRateEMA
+    if v.Magnitude<4 or math.abs(omega)<0.05 or profile.coordinatedTurnConfidence<0.12 then return nil end
+    local w = math.clamp(omega,-MAX_CIRCLE_OMEGA,MAX_CIRCLE_OMEGA)
+    local wt = w*horizon
+    local s,c = math.sin(wt),math.cos(wt)
+    local dx = v.X*s/w - v.Z*(1-c)/w
+    local dz = v.X*(1-c)/w + v.Z*s/w
+    return horizontal(currentPos)+Vector3.new(dx,0,dz)
+end
+
+local function predictCircleXZ(profile,currentPos,horizon)
+    if not profile.circleCenter or profile.circleRadius<MIN_CIRCLE_RADIUS or math.abs(profile.circleOmega)<0.06 or profile.circleConfidence<0.14 then
+        return nil
+    end
+    local center = horizontal(profile.circleCenter)
+    local radial = horizontal(currentPos)-center
+    if radial.Magnitude<1 then return nil end
+    local baseRadius = profile.circleRadius*0.65 + radial.Magnitude*0.35
+    local futureRadius = math.clamp(baseRadius + profile.circleRadialSpeed*horizon, profile.circleRadius*0.45, profile.circleRadius*1.65)
+    local angle = math.clamp(profile.circleOmega*horizon,-math.pi*1.6,math.pi*1.6)
+    return center + rotateXZ(radial.Unit*futureRadius,angle)
+end
+
+local function predictOrbitXZ(profile,targetPos,serverOrigin,targetVelocity,localVelocity,horizon)
+    local radial = horizontal(targetPos-serverOrigin)
+    local relativeVelocity = horizontal(targetVelocity-localVelocity)
+    local r,speed = radial.Magnitude,relativeVelocity.Magnitude
+    if r<3 or r>MAX_CIRCLE_RADIUS or speed<4 then return nil,0 end
+
+    local ru = radial.Unit
+    local radialSpeed = relativeVelocity:Dot(ru)
+    local tangential = relativeVelocity-ru*radialSpeed
+    local tangentFraction = tangential.Magnitude/math.max(speed,1)
+    local omega = (radial.X*relativeVelocity.Z-radial.Z*relativeVelocity.X)/math.max(r*r,1)
+    if math.abs(omega)<0.06 or math.abs(omega)>MAX_CIRCLE_OMEGA then return nil,0 end
+
+    local tangentialScore = math.clamp((tangentFraction-0.52)/0.42,0,1)
+    local stability = math.max(profile.circleConfidence,profile.coordinatedTurnConfidence)
+    local agreement = 1
+    local learnedOmega = math.abs(profile.circleOmega)>0.06 and profile.circleOmega or profile.signedTurnRateEMA
+    if math.abs(learnedOmega)>0.06 and signOf(learnedOmega)~=signOf(omega) then agreement=0.18 end
+    local confidence = math.clamp(tangentialScore*(0.25+0.75*stability)*agreement,0,1)
+    if confidence<0.15 then return nil,confidence end
+
+    if math.abs(profile.circleOmega)>0.06 and signOf(profile.circleOmega)==signOf(omega) then
+        omega = omega*0.45 + profile.circleOmega*0.55
+    end
+    local futureCenter = horizontal(serverOrigin)+horizontal(localVelocity)*horizon
+    local futureRadius = math.clamp(r+radialSpeed*horizon,2,MAX_CIRCLE_RADIUS)
+    local futureRadial = rotateXZ(radial.Unit*futureRadius,omega*horizon)
+    return futureCenter+futureRadial,confidence
+end
+
+local function predictVerticalY(profile,currentPos,horizon)
+    local y0 = currentPos.Y
+    local vy = profile.fastVel.Y*0.72 + profile.slowVel.Y*0.28
+
+    if profile.flightConfidence>0.48 then
+        local ay = math.clamp(profile.verticalAccelEMA,-95,95)
+        local at = math.min(horizon,0.55)
+        return y0 + vy*horizon + 0.5*ay*at*at, "FLIGHT"
+    end
+
+    if profile.jumpConfidence>0.34 then
+        local g = math.max(Workspace.Gravity,1)
+        local y = y0 + vy*horizon - 0.5*g*horizon*horizon
+        if profile.groundY and profile.groundOffset then
+            local landingY = profile.groundY+profile.groundOffset
+            local height = math.max(y0-landingY,0)
+            local disc = vy*vy+2*g*height
+            local tLand = (vy+math.sqrt(math.max(disc,0)))/g
+            if tLand>=0 and horizon>tLand then y=landingY end
+            y = math.max(y,landingY-0.2)
+        end
+        return y,"JUMP"
+    end
+
+    -- Grounded targets: reject animation/replication bobbing instead of leading vertically.
+    return y0,"GROUND"
+end
+
+local function predictHRP(profile,currentPos,horizon,serverOrigin,localVelocity)
+    horizon = math.clamp(horizon,0,MAX_MODEL_HORIZON)
+
+    local linear = predictLinearXZ(profile,currentPos,horizon)
+    local turn = predictCoordinatedTurnXZ(profile,currentPos,horizon)
+    local circle = predictCircleXZ(profile,currentPos,horizon)
+    local orbit,orbitConfidence = predictOrbitXZ(profile,currentPos,serverOrigin,profile.fastVel,localVelocity,horizon)
+    profile.orbitConfidence = orbitConfidence
+
+    -- IMM-style model blending: a stable maneuver gets a strong dedicated model, while
+    -- uncertain movement stays close to the robust linear/juke model.
+    local wLinear = 1.0
+    local wTurn = turn and (0.25+2.0*profile.coordinatedTurnConfidence^2) or 0
+    local wCircle = circle and (0.35+3.3*profile.circleConfidence^2) or 0
+    local wOrbit = orbit and (0.35+4.0*orbitConfidence^2) or 0
+
+    local maxStructured = math.max(profile.coordinatedTurnConfidence,profile.circleConfidence,orbitConfidence)
+    wLinear *= math.max(0.08,1-0.82*maxStructured)
+
+    local sum = wLinear+wTurn+wCircle+wOrbit
+    local xz = linear*wLinear
+    if turn then xz += turn*wTurn end
+    if circle then xz += circle*wCircle end
+    if orbit then xz += orbit*wOrbit end
+    xz /= math.max(sum,1e-6)
+
+    local y,verticalMode = predictVerticalY(profile,currentPos,horizon)
+    local predicted = Vector3.new(xz.X,y,xz.Z)
+
+    if verticalMode=="FLIGHT" then
+        profile.movementMode="FLIGHT"
+    elseif verticalMode=="JUMP" then
+        profile.movementMode="JUMP"
+    elseif orbitConfidence>0.52 then
+        profile.movementMode="ORBIT"
+    elseif profile.circleConfidence>0.52 then
+        profile.movementMode="CIRCLE"
+    elseif profile.coordinatedTurnConfidence>0.48 then
+        profile.movementMode="TURN"
+    elseif profile.jukeEMA>0.46 then
+        profile.movementMode="JUKE"
+    else
+        profile.movementMode="GROUND"
+    end
+
+    local learnedSpeedEnvelope = math.max(20,profile.speedEMA*1.8,profile.peakSpeed*1.35)
+    local displacement = predicted-currentPos
+    local maxDisplacement = learnedSpeedEnvelope*horizon+7
+    if displacement.Magnitude>maxDisplacement and displacement.Magnitude>0 then
+        predicted = currentPos+displacement.Unit*maxDisplacement
+    end
+    return predicted
+end
+
+-- ===== Intercept =====
+local function calculateAim(origin,localVelocity,targetHRP,targetPart,profile,pingMs)
+    local pingSeconds = pingMs/1000
+    local jitterSeconds = pingJitterMs/1000
+    local networkLead = pingSeconds*NETWORK_RTT_FACTOR + jitterSeconds*JITTER_LEAD_FACTOR + profile.leadBiasSeconds
+    networkLead = math.clamp(networkLead,0,0.52)
+
+    local outbound = math.clamp(pingSeconds*0.5,0,0.24)
+    local serverOrigin = origin+localVelocity*outbound
+    local speed = math.clamp(projectileSpeedModel,MIN_PROJECTILE_SPEED,MAX_PROJECTILE_SPEED)
+
+    local partOffset = targetPart.Position-targetHRP.Position
+    local travelTime = (targetHRP.Position-serverOrigin).Magnitude/speed
+    local predictedHRP = targetHRP.Position
+    local horizon = networkLead+travelTime
+
+    for _=1,5 do
+        horizon = math.clamp(networkLead+travelTime,0,MAX_MODEL_HORIZON)
+        predictedHRP = predictHRP(profile,targetHRP.Position,horizon,serverOrigin,localVelocity)
+        travelTime = (predictedHRP-serverOrigin).Magnitude/speed
+    end
+
+    horizon = math.clamp(networkLead+travelTime,0,MAX_MODEL_HORIZON)
+    predictedHRP = predictHRP(profile,targetHRP.Position,horizon,serverOrigin,localVelocity)
+    local aimPos = predictedHRP+partOffset
+    return aimPos,predictedHRP,horizon,travelTime,networkLead,serverOrigin
+end
+
+-- ===== Prediction residual learning =====
+local function scheduleResidualLearning(player,profile,predictedHRP,expectedHorizon,shotVelocity,shotJuke)
+    local confidence = math.clamp(1-shotJuke,0.12,1)
+    local velocityAtShot = shotVelocity
+    local speedAtShot = velocityAtShot.Magnitude
+
+    task.delay(expectedHorizon+0.03,function()
+        if not profiles[player.UserId] or not player.Character or not isAlive(player.Character) then return end
+        local hrp = getHRP(player.Character)
+        if not hrp then return end
+        local errorVector = hrp.Position-predictedHRP
+        if errorVector.Magnitude>65 then return end
+
+        if speedAtShot>5 then
+            local moveDir = velocityAtShot.Unit
+            local along = errorVector:Dot(moveDir)
+            local timeError = along/speedAtShot
+            local correction = math.clamp(timeError,-0.22,0.22)*0.075*confidence
+            profile.leadBiasSeconds = math.clamp(profile.leadBiasSeconds+correction,-0.22,0.34)
+
+            if profile.movementMode~="CIRCLE" and profile.movementMode~="ORBIT" then
+                local lateral = errorVector-moveDir*along
+                lateral = clampMagnitude(lateral,15)
+                profile.lateralBias = profile.lateralBias:Lerp(lateral*0.25,0.045*confidence)
+            end
+        end
+        profile.shotsLearned += 1
+    end)
+end
+
+-- ===== Shot / hit feedback =====
+local function newestMatchingShot(victimHumanoid,maxAge)
+    local now=os.clock()
+    for i=#shots,1,-1 do
+        local s=shots[i]
+        if now-s.fireTime<=maxAge and not s.finalHit then
+            if not victimHumanoid or s.targetHumanoid==victimHumanoid then return s end
+        end
+    end
+    return nil
+end
+
+local function markShotHit(shot,strength,source)
+    if not shot or shot.finalHit then return end
+    local p=profiles[shot.targetUserId]
+    if not p then return end
+
+    if strength=="confirmed" then
+        shot.finalHit=true
+        shot.hitStrength="confirmed"
+        p.confirmedHits += 1
+    elseif strength=="probable" then
+        shot.finalHit=true
+        shot.hitStrength="probable"
+        p.probableHits += 1
+    else
+        return
+    end
+    p.lastHitSource=source or strength
+end
+
+local function describeArg(v)
+    local ty=typeof(v)
+    if ty=="Instance" then return v.ClassName..":"..v:GetFullName() end
+    if ty=="Vector3" then return string.format("Vector3(%.1f,%.1f,%.1f)",v.X,v.Y,v.Z) end
+    return ty..":"..tostring(v)
+end
+
+local function inspectFeedbackArgs(sourceName,...)
+    local args=table.pack(...)
+    local victimHumanoid=nil
+    local attacker=nil
+    local sourceInstance=nil
+    local amount=nil
+    local textTags={}
+
+    for i=1,args.n do
+        local v=args[i]
+        if typeof(v)=="Instance" then
+            if v:IsA("Humanoid") then
+                victimHumanoid = victimHumanoid or v
+            elseif v:IsA("Player") then
+                if v==LocalPlayer then attacker=v end
+                local h=getHumanoid(v.Character)
+                if h and not victimHumanoid and v~=LocalPlayer then victimHumanoid=h end
+            elseif v:IsA("Model") then
+                local h=v:FindFirstChildOfClass("Humanoid")
+                if h then victimHumanoid=victimHumanoid or h end
+                if LocalPlayer.Character and v==LocalPlayer.Character then sourceInstance=v end
+            elseif LocalPlayer.Character and v:IsDescendantOf(LocalPlayer.Character) then
+                sourceInstance=v
+            end
+        elseif type(v)=="number" then
+            amount=amount or v
+        elseif type(v)=="string" then
+            table.insert(textTags,string.lower(v))
+        elseif type(v)=="table" then
+            -- Common table-shaped payloads. Read only obvious fields; never assume schema.
+            local okA,a=pcall(function() return v.attacker or v.Attacker or v.source or v.Source end)
+            if okA and typeof(a)=="Instance" then
+                if a==LocalPlayer or (LocalPlayer.Character and a==LocalPlayer.Character) then attacker=LocalPlayer end
+            end
+            local okV,vic=pcall(function() return v.humanoid or v.Humanoid or v.victim or v.Victim end)
+            if okV and typeof(vic)=="Instance" then
+                if vic:IsA("Humanoid") then victimHumanoid=victimHumanoid or vic
+                elseif vic:IsA("Model") then victimHumanoid=victimHumanoid or vic:FindFirstChildOfClass("Humanoid") end
+            end
+        end
+    end
+
+    local tagText=table.concat(textTags," ")
+    local saysFireball = string.find(tagText,"fireball",1,true) or string.find(tagText,"newfireball",1,true) or string.find(tagText,"fire ball",1,true)
+    local shot=newestMatchingShot(victimHumanoid,2.2)
+    if not shot then return end
+
+    local now=os.clock()
+    local timingError=math.abs(now-shot.expectedImpactTime)
+    local nearExpected = timingError <= math.max(0.48,(shot.pingMs/1000)+0.20)
+    local sourceIsUs = attacker==LocalPlayer or sourceInstance~=nil
+
+    if sourceIsUs and (not victimHumanoid or victimHumanoid==shot.targetHumanoid) then
+        markShotHit(shot,"confirmed",sourceName..":source=LocalPlayer")
+    elseif saysFireball and nearExpected and (not victimHumanoid or victimHumanoid==shot.targetHumanoid) then
+        markShotHit(shot,"probable",sourceName..":fireball-tag")
+    elseif nearExpected and shot.probableContact and (not victimHumanoid or victimHumanoid==shot.targetHumanoid) then
+        markShotHit(shot,"probable",sourceName..":projectile+timing")
+    else
+        local p=profiles[shot.targetUserId]
+        if p then p.ambiguousDamageEvents += 1 end
+    end
+
+    if amount then shot.lastObservedDamage=amount end
+end
+
+if damageIndicatorEvent and damageIndicatorEvent:IsA("RemoteEvent") then
+    STATE.DamageConn = damageIndicatorEvent.OnClientEvent:Connect(function(...)
+        damageDebugCount += 1
+        if damageDebugCount<=8 then
+            local args=table.pack(...)
+            local shown={}
+            for i=1,args.n do table.insert(shown,describeArg(args[i])) end
+            print("[AdaptiveFireball-V4] DamageIndicatorEvent OnClientEvent args:",table.concat(shown," | "))
+        end
+        inspectFeedbackArgs("DamageIndicatorEvent",...)
+    end)
+else
+    print("[AdaptiveFireball-V4] DamageIndicatorEvent not found as a RemoteEvent; hit feedback will rely on projectile tracking.")
+end
+
+-- Main RemoteEvent might also send server->client acknowledgements. Observe only payloads that
+-- arrive; this does not hook/spoof the remote and is bounded to avoid console spam.
+if remote:IsA("RemoteEvent") then
+    STATE.MainRemoteConn = remote.OnClientEvent:Connect(function(...)
+        mainRemoteDebugCount += 1
+        if mainRemoteDebugCount<=5 then
+            local args=table.pack(...)
+            local shown={}
+            for i=1,args.n do table.insert(shown,describeArg(args[i])) end
+            print("[AdaptiveFireball-V4] SkillsInRS.RemoteEvent OnClientEvent args:",table.concat(shown," | "))
+        end
+        inspectFeedbackArgs("MainRemoteEvent",...)
+    end)
+end
+
+local function resolveShotLater(shot)
+    task.delay(math.max(2.0,shot.horizon+0.9),function()
+        if shot.finalHit then return end
+        local p=profiles[shot.targetUserId]
+        if not p then return end
+
+        if shot.projectileTracked then
+            if shot.minProjectileDistance and shot.minProjectileDistance<=shot.contactThreshold then
+                markShotHit(shot,"probable","tracked-projectile-near-target")
+            else
+                p.trackedMisses += 1
+                shot.resolvedMiss=true
+
+                -- Very small correction from a high-quality tracked miss. Positive along-target
+                -- error means the projectile was behind the moving target at closest approach.
+                if shot.closestError and shot.closestTargetVelocity and shot.closestTargetVelocity.Magnitude>6 then
+                    local dir=shot.closestTargetVelocity.Unit
+                    local along=shot.closestError:Dot(dir)
+                    local dtError=along/shot.closestTargetVelocity.Magnitude
+                    p.leadBiasSeconds=math.clamp(p.leadBiasSeconds+math.clamp(dtError,-0.16,0.16)*0.035,-0.22,0.34)
+                end
+            end
+        end
+    end)
+end
+
+-- ===== Visible projectile detection / calibration / probable contact =====
+local function pickShotForProjectile(obj)
+    local now=os.clock()
+    local best,bestScore=nil,-math.huge
+    for i=#shots,1,-1 do
+        local s=shots[i]
+        local age=now-s.fireTime
+        if age>=0 and age<=0.50 and not s.projectile then
+            local d=(obj.Position-s.serverOrigin).Magnitude
+            if d<=42 then
+                local score=1-d/42-age*0.7
+                local nm=string.lower(obj.Name)
+                if string.find(nm,"fire",1,true) or string.find(nm,"ball",1,true) or string.find(nm,"orb",1,true) or string.find(nm,"electro",1,true) then
+                    score += 0.35
+                end
+                if score>bestScore then best,bestScore=s,score end
+            end
+        end
+    end
+    return best
+end
+
+local function trackProjectileCandidate(obj,shot)
+    if not obj.Parent or shot.projectile then return end
+    local p0=obj.Position
+    local t0=os.clock()
+    task.wait(0.045)
+    if not obj.Parent or shot.projectile then return end
+
+    local dt=os.clock()-t0
+    local delta=obj.Position-p0
+    local speed=dt>0 and delta.Magnitude/dt or 0
+    if speed<MIN_PROJECTILE_SPEED or speed>MAX_PROJECTILE_SPEED then return end
+    if delta.Magnitude<0.03 then return end
+    local alignment=delta.Unit:Dot(shot.direction)
+    if alignment<0.70 then return end
+
+    shot.projectile=obj
+    shot.projectileTracked=true
+    shot.contactThreshold=math.clamp(obj.Size.Magnitude*0.45+3.8,4.0,10.0)
+
+    local observedSpeeds={speed}
+    local touchConn=nil
+    local okTouch=pcall(function()
+        touchConn=obj.Touched:Connect(function(hit)
+            if shot.targetCharacter and hit and hit:IsDescendantOf(shot.targetCharacter) then
+                shot.probableContact=true
+                shot.minProjectileDistance=0
+            end
+        end)
+    end)
+
+    task.spawn(function()
+        local lastPos=obj.Position
+        local lastT=os.clock()
+        local endAt=shot.fireTime+math.max(2.1,shot.horizon+0.9)
+
+        while obj.Parent and os.clock()<endAt do
+            RunService.Heartbeat:Wait()
+            if not obj.Parent then break end
+            local now=os.clock()
+            local dtt=now-lastT
+            if dtt>0.012 then
+                local pos=obj.Position
+                local ds=(pos-lastPos).Magnitude/dtt
+                if ds>=MIN_PROJECTILE_SPEED and ds<=MAX_PROJECTILE_SPEED then table.insert(observedSpeeds,ds) end
+                lastPos,lastT=pos,now
+
+                local targetChar=shot.targetPlayer and shot.targetPlayer.Character
+                local thrp=getHRP(targetChar)
+                if thrp then
+                    local dist=(pos-thrp.Position).Magnitude
+                    if not shot.minProjectileDistance or dist<shot.minProjectileDistance then
+                        shot.minProjectileDistance=dist
+                        shot.closestError=thrp.Position-pos
+                        local prof=profiles[shot.targetUserId]
+                        shot.closestTargetVelocity=prof and prof.fastVel or ZERO
+                    end
+                    if dist<=shot.contactThreshold then shot.probableContact=true end
+                end
+            end
+        end
+
+        if touchConn then pcall(function() touchConn:Disconnect() end) end
+
+        if #observedSpeeds>=2 then
+            table.sort(observedSpeeds)
+            local median=observedSpeeds[math.ceil(#observedSpeeds/2)]
+            projectileCalibrationSamples += 1
+            local alpha=projectileCalibrationSamples<=2 and 0.58 or 0.20
+            projectileSpeedModel += (median-projectileSpeedModel)*alpha
+            print(string.format("[AdaptiveFireball-V4] Projectile calibrated %.1f stud/s (sample %.1f, n=%d)",projectileSpeedModel,median,projectileCalibrationSamples))
+        end
+
+        if shot.probableContact and not shot.finalHit then
+            -- Contact alone is not authoritative because client physics/touch can be imperfect.
+            -- Wait briefly for a server event; otherwise keep it as probable.
+            task.delay(0.20,function()
+                if not shot.finalHit then markShotHit(shot,"probable","tracked-projectile-contact") end
+            end)
+        end
+    end)
+end
+
+local function considerProjectileCandidate(obj)
+    if not obj:IsA("BasePart") or belongsToCharacter(obj) then return end
+    local shot=pickShotForProjectile(obj)
+    if not shot then return end
+    task.defer(function() trackProjectileCandidate(obj,shot) end)
+end
+
+STATE.ProjectileConn=Workspace.DescendantAdded:Connect(considerProjectileCandidate)
+
+-- ===== Mobile-friendly GUI =====
+local gui = Instance.new("ScreenGui")
+gui.Name = "FireballAdaptiveV4GUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+STATE.GUI = gui
+
+-- Small always-available button for mobile.
+local miniToggle = Instance.new("TextButton")
+miniToggle.Name = "MiniToggle"
+miniToggle.Size = UDim2.new(0, 92, 0, 44)
+miniToggle.Position = UDim2.new(0, 12, 0.45, 0)
+miniToggle.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+miniToggle.TextColor3 = Color3.fromRGB(255, 115, 115)
+miniToggle.Text = "FIRE AIM"
+miniToggle.Font = Enum.Font.SourceSansBold
+miniToggle.TextSize = 15
+miniToggle.AutoButtonColor = true
+miniToggle.Active = true
+miniToggle.Parent = gui
+
+local miniCorner = Instance.new("UICorner")
+miniCorner.CornerRadius = UDim.new(0, 10)
+miniCorner.Parent = miniToggle
+
+local miniStroke = Instance.new("UIStroke")
+miniStroke.Thickness = 1
+miniStroke.Transparency = 0.25
+miniStroke.Color = Color3.fromRGB(255, 90, 90)
+miniStroke.Parent = miniToggle
+
+local frame = Instance.new("Frame")
+frame.Name = "Main"
+frame.Size = UDim2.new(0.92, 0, 0, 366)
+frame.Position = UDim2.new(0.5, 0, 0.18, 0)
+frame.AnchorPoint = Vector2.new(0.5, 0)
+frame.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+frame.BorderSizePixel = 0
+frame.Visible = false
+frame.Active = true
+frame.Parent = gui
+
+local sizeConstraint = Instance.new("UISizeConstraint")
+sizeConstraint.MinSize = Vector2.new(300, 366)
+sizeConstraint.MaxSize = Vector2.new(410, 366)
+sizeConstraint.Parent = frame
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 10)
+corner.Parent = frame
+
+local stroke = Instance.new("UIStroke")
+stroke.Thickness = 1
+stroke.Transparency = 0.40
+stroke.Color = Color3.fromRGB(90, 90, 90)
+stroke.Parent = frame
+
+-- Drag handle / title.
+local title = Instance.new("TextLabel")
+title.Name = "DragHandle"
+title.Size = UDim2.new(1, -54, 0, 34)
+title.Position = UDim2.new(0, 10, 0, 4)
+title.BackgroundTransparency = 1
+title.Text = "Adaptive Fireball Universal v4 - Multi-Model"
+title.TextColor3 = Color3.fromRGB(255, 90, 90)
+title.Font = Enum.Font.SourceSansBold
+title.TextSize = 17
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Active = true
+title.Parent = frame
+
+local closeX = Instance.new("TextButton")
+closeX.Name = "CloseX"
+closeX.Size = UDim2.new(0, 40, 0, 32)
+closeX.Position = UDim2.new(1, -46, 0, 5)
+closeX.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+closeX.Text = "X"
+closeX.TextColor3 = Color3.fromRGB(240, 240, 240)
+closeX.Font = Enum.Font.SourceSansBold
+closeX.TextSize = 16
+closeX.Parent = frame
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 8)
+closeCorner.Parent = closeX
+
+local input = Instance.new("TextBox")
+input.Name = "TargetInput"
+input.Size = UDim2.new(1, -126, 0, 38)
+input.Position = UDim2.new(0, 10, 0, 44)
+input.PlaceholderText = "Username / display name..."
+input.BackgroundColor3 = Color3.fromRGB(36, 36, 36)
+input.TextColor3 = Color3.fromRGB(235, 235, 235)
+input.PlaceholderColor3 = Color3.fromRGB(155, 155, 155)
+input.Font = Enum.Font.SourceSans
+input.TextSize = 15
+input.ClearTextOnFocus = false
+input.TextXAlignment = Enum.TextXAlignment.Left
+input.Parent = frame
+local inputCorner = Instance.new("UICorner")
+inputCorner.CornerRadius = UDim.new(0, 8)
+inputCorner.Parent = input
+
+local lockButton = Instance.new("TextButton")
+lockButton.Name = "LockTarget"
+lockButton.Size = UDim2.new(0, 100, 0, 38)
+lockButton.Position = UDim2.new(1, -110, 0, 44)
+lockButton.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
+lockButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+lockButton.Text = "LOCK"
+lockButton.Font = Enum.Font.SourceSansBold
+lockButton.TextSize = 15
+lockButton.Parent = frame
+local lockCorner = Instance.new("UICorner")
+lockCorner.CornerRadius = UDim.new(0, 8)
+lockCorner.Parent = lockButton
+
+local partLabel = Instance.new("TextLabel")
+partLabel.Size = UDim2.new(1, -20, 0, 24)
+partLabel.Position = UDim2.new(0, 10, 0, 88)
+partLabel.BackgroundTransparency = 1
+partLabel.TextColor3 = Color3.fromRGB(255, 130, 130)
+partLabel.Font = Enum.Font.SourceSansBold
+partLabel.TextSize = 14
+partLabel.TextXAlignment = Enum.TextXAlignment.Left
+partLabel.Parent = frame
+
+local telemetry = Instance.new("TextLabel")
+telemetry.Size = UDim2.new(1, -20, 0, 86)
+telemetry.Position = UDim2.new(0, 10, 0, 114)
+telemetry.BackgroundColor3 = Color3.fromRGB(27, 27, 27)
+telemetry.BackgroundTransparency = 0.15
+telemetry.TextColor3 = Color3.fromRGB(110, 255, 205)
+telemetry.Font = Enum.Font.SourceSansBold
+telemetry.TextSize = 12
+telemetry.TextWrapped = true
+telemetry.TextXAlignment = Enum.TextXAlignment.Left
+telemetry.TextYAlignment = Enum.TextYAlignment.Center
+telemetry.Text = "Mode: — | Dist: — | Speed: — | Ping: —\nCircle: — | Orbit: — | Juke: — | Jump/Fly: —/—\nHits C/P/M: —/—/— | Lead: — | Proj: —"
+telemetry.Parent = frame
+local telemetryCorner = Instance.new("UICorner")
+telemetryCorner.CornerRadius = UDim.new(0, 8)
+telemetryCorner.Parent = telemetry
+
+local autoButton = Instance.new("TextButton")
+autoButton.Name = "AutoButton"
+autoButton.Size = UDim2.new(0.5, -15, 0, 44)
+autoButton.Position = UDim2.new(0, 10, 0, 208)
+autoButton.BackgroundColor3 = Color3.fromRGB(62, 42, 42)
+autoButton.TextColor3 = Color3.fromRGB(255, 150, 150)
+autoButton.Text = "AUTO: OFF"
+autoButton.Font = Enum.Font.SourceSansBold
+autoButton.TextSize = 16
+autoButton.Parent = frame
+local autoCorner = Instance.new("UICorner")
+autoCorner.CornerRadius = UDim.new(0, 8)
+autoCorner.Parent = autoButton
+
+local bodyButton = Instance.new("TextButton")
+bodyButton.Name = "BodyButton"
+bodyButton.Size = UDim2.new(0.5, -15, 0, 44)
+bodyButton.Position = UDim2.new(0.5, 5, 0, 208)
+bodyButton.BackgroundColor3 = Color3.fromRGB(42, 52, 62)
+bodyButton.TextColor3 = Color3.fromRGB(175, 220, 255)
+bodyButton.Text = "BODY: —"
+bodyButton.Font = Enum.Font.SourceSansBold
+bodyButton.TextSize = 15
+bodyButton.Parent = frame
+local bodyCorner = Instance.new("UICorner")
+bodyCorner.CornerRadius = UDim.new(0, 8)
+bodyCorner.Parent = bodyButton
+
+local hideButton = Instance.new("TextButton")
+hideButton.Name = "HideButton"
+hideButton.Size = UDim2.new(0.5, -15, 0, 38)
+hideButton.Position = UDim2.new(0, 10, 0, 260)
+hideButton.BackgroundColor3 = Color3.fromRGB(48, 48, 48)
+hideButton.TextColor3 = Color3.fromRGB(240, 240, 240)
+hideButton.Text = "HIDE MENU"
+hideButton.Font = Enum.Font.SourceSansBold
+hideButton.TextSize = 14
+hideButton.Parent = frame
+local hideCorner = Instance.new("UICorner")
+hideCorner.CornerRadius = UDim.new(0, 8)
+hideCorner.Parent = hideButton
+
+local destroyButton = Instance.new("TextButton")
+destroyButton.Name = "DestroyButton"
+destroyButton.Size = UDim2.new(0.5, -15, 0, 38)
+destroyButton.Position = UDim2.new(0.5, 5, 0, 260)
+destroyButton.BackgroundColor3 = Color3.fromRGB(75, 35, 35)
+destroyButton.TextColor3 = Color3.fromRGB(255, 185, 185)
+destroyButton.Text = "DESTROY"
+destroyButton.Font = Enum.Font.SourceSansBold
+destroyButton.TextSize = 14
+destroyButton.Parent = frame
+local destroyCorner = Instance.new("UICorner")
+destroyCorner.CornerRadius = UDim.new(0, 8)
+destroyCorner.Parent = destroyButton
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -20, 0, 48)
+status.Position = UDim2.new(0, 10, 0, 304)
+status.BackgroundTransparency = 1
+status.TextColor3 = Color3.fromRGB(120, 255, 120)
+status.Font = Enum.Font.SourceSans
+status.TextSize = 13
+status.TextWrapped = true
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
+status.Text = "LOCK target -> AUTO ON | Auto Center recommended\nCooldown: exactly 1.50s"
+status.Parent = frame
+
+local function updatePartLabel()
+    local bodyName = BODY_PARTS[currentBodyPartIndex].name
+    partLabel.Text = "Body Part: " .. bodyName
+    bodyButton.Text = "BODY: " .. string.upper(bodyName)
+end
+updatePartLabel()
+
+local function updateAutoButton()
+    if autoFire then
+        autoButton.Text = "AUTO: ON"
+        autoButton.BackgroundColor3 = Color3.fromRGB(38, 72, 45)
+        autoButton.TextColor3 = Color3.fromRGB(150, 255, 170)
+    else
+        autoButton.Text = "AUTO: OFF"
+        autoButton.BackgroundColor3 = Color3.fromRGB(62, 42, 42)
+        autoButton.TextColor3 = Color3.fromRGB(255, 150, 150)
+    end
+end
+updateAutoButton()
+
+-- Touch/mouse dragging, useful on phones where the default position covers gameplay.
+do
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+    local dragInput = nil
+
+    title.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch
+            or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = inp.Position
+            startPos = frame.Position
+
+            inp.Changed:Connect(function()
+                if inp.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    title.InputChanged:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch
+            or inp.UserInputType == Enum.UserInputType.MouseMovement then
+            dragInput = inp
+        end
+    end)
+
+    STATE.DragConn = UserInputService.InputChanged:Connect(function(inp)
+        if dragging and inp == dragInput and dragStart and startPos then
+            local delta = inp.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+-- ===== Fire =====
+local function fireAtTarget()
+    local now=os.clock()
+    if now-lastFire<COOLDOWN then return end
+
+    local targetPlayer=findPlayerByPartial(targetName)
+    if not targetPlayer or not isAlive(targetPlayer.Character) then
+        autoFire=false
+        status.Text="Target unavailable/dead - Auto stopped"
+        status.TextColor3=Color3.fromRGB(255,90,90)
+        updateAutoButton()
+        return
+    end
+    if not isAlive(LocalPlayer.Character) then
+        autoFire=false
+        status.Text="You died - Auto stopped"
+        status.TextColor3=Color3.fromRGB(255,90,90)
+        updateAutoButton()
+        return
+    end
+
+    local targetChar=targetPlayer.Character
+    local targetHRP=getHRP(targetChar)
+    local targetPart=getTargetPart(targetChar)
+    local targetHum=getHumanoid(targetChar)
+    local localHRP=getHRP(LocalPlayer.Character)
+    if not targetHRP or not targetPart or not localHRP then return end
+
+    local profile=updateProfile(targetPlayer,targetHRP)
+    local pingMs=getPingMs()
+    local origin=localHRP.Position
+    local distance=(targetHRP.Position-origin).Magnitude
+    if distance>MAX_DISTANCE then
+        status.Text=string.format("Target %.0f studs away (max %d)",distance,MAX_DISTANCE)
+        status.TextColor3=Color3.fromRGB(255,190,90)
+        return
+    end
+
+    local localVelocity=localHRP.AssemblyLinearVelocity
+    local aimPos,predictedHRP,horizon,travelTime,networkLead,serverOrigin=
+        calculateAim(origin,localVelocity,targetHRP,targetPart,profile,pingMs)
+
+    local direction=aimPos-serverOrigin
+    if direction.Magnitude<0.1 then return end
+
+    lastFire=now
+    local shot={
+        fireTime=now,
+        targetPlayer=targetPlayer,
+        targetUserId=targetPlayer.UserId,
+        targetCharacter=targetChar,
+        targetHumanoid=targetHum,
+        targetPart=targetPart,
+        serverOrigin=serverOrigin,
+        aimPos=aimPos,
+        predictedHRP=predictedHRP,
+        horizon=horizon,
+        travelTime=travelTime,
+        networkLead=networkLead,
+        expectedImpactTime=now+horizon,
+        pingMs=pingMs,
+        direction=direction.Unit,
+        mode=profile.movementMode,
+        projectile=nil,
+        projectileTracked=false,
+        probableContact=false,
+        finalHit=false,
+        minProjectileDistance=nil,
+        contactThreshold=6,
+    }
+    table.insert(shots,shot)
+    while #shots>MAX_SHOTS_KEPT do table.remove(shots,1) end
+    profile.shotsFired += 1
+
+    local ok,err=pcall(function() remote:FireServer(aimPos,"NewFireball") end)
+    if not ok then
+        warn("[AdaptiveFireball-V4] FireServer failed:",err)
+        return
+    end
+
+    scheduleResidualLearning(targetPlayer,profile,predictedHRP,horizon,profile.fastVel,profile.jukeEMA)
+    resolveShotLater(shot)
+
+    status.TextColor3=Color3.fromRGB(120,255,120)
+    status.Text=string.format("%s -> %s | %s | shots %d\nCooldown: 1.50s",targetPlayer.Name,BODY_PARTS[currentBodyPartIndex].name,profile.movementMode,profile.shotsFired)
+
+    print(string.format(
+        "[AdaptiveFireball-V4] %s | %s | dist %.1f | vel %.1f | ping %.0f±%.0fms | C %.2f O %.2f T %.2f J %.2f JP %.2f F %.2f | lead %.3f | proj %.1f",
+        targetPlayer.Name,profile.movementMode,distance,profile.fastVel.Magnitude,pingMs,pingJitterMs,
+        profile.circleConfidence,profile.orbitConfidence,profile.coordinatedTurnConfidence,profile.jukeEMA,
+        profile.jumpConfidence,profile.flightConfidence,horizon,projectileSpeedModel
+    ))
+end
+
+-- ===== Auto loop =====
+local function startAuto()
+    if STATE.AutoConn then return end
+    -- Learn one full cooldown before the first shot.
+    lastFire=os.clock()
+
+    STATE.AutoConn=RunService.Heartbeat:Connect(function()
+        if not autoFire or targetName=="" then return end
+
+        local targetPlayer=findPlayerByPartial(targetName)
+        if not targetPlayer or not isAlive(targetPlayer.Character) then
+            autoFire=false
+            status.Text="Target unavailable/dead - Auto stopped"
+            status.TextColor3=Color3.fromRGB(255,90,90)
+            updateAutoButton()
+            return
+        end
+        if not isAlive(LocalPlayer.Character) then
+            autoFire=false
+            status.Text="You died - Auto stopped"
+            status.TextColor3=Color3.fromRGB(255,90,90)
+            updateAutoButton()
+            return
+        end
+
+        local targetHRP=getHRP(targetPlayer.Character)
+        local localHRP=getHRP(LocalPlayer.Character)
+        if targetHRP and localHRP then
+            local profile=updateProfile(targetPlayer,targetHRP)
+            local pingMs=getPingMs()
+            local dist=(localHRP.Position-targetHRP.Position).Magnitude
+            local targetPart=getTargetPart(targetPlayer.Character)
+            local horizon,networkLead=0,0
+            if targetPart then
+                local _,_,h,_,nl=calculateAim(localHRP.Position,localHRP.AssemblyLinearVelocity,targetHRP,targetPart,profile,pingMs)
+                horizon,networkLead=h,nl
+            end
+
+            telemetry.Text=string.format(
+                "Mode: %s | Dist: %.0f | Speed: %.1f | Ping: %.0f±%.0fms\nC: %.2f O: %.2f T: %.2f J: %.2f | Jump/Fly: %.2f/%.2f\nHits C/P/M: %d/%d/%d | Lead: %.3fs | Proj: %.1f",
+                profile.movementMode,dist,profile.fastVel.Magnitude,pingMs,pingJitterMs,
+                profile.circleConfidence,profile.orbitConfidence,profile.coordinatedTurnConfidence,profile.jukeEMA,
+                profile.jumpConfidence,profile.flightConfidence,
+                profile.confirmedHits,profile.probableHits,profile.trackedMisses,horizon,projectileSpeedModel
+            )
+        end
+
+        fireAtTarget()
+    end)
+end
+
+local function stopAuto()
+    if STATE.AutoConn then
+        STATE.AutoConn:Disconnect()
+        STATE.AutoConn=nil
+    end
+    telemetry.Text="Mode: — | Dist: — | Speed: — | Ping: —\nC: — O: — T: — J: — | Jump/Fly: —/—\nHits C/P/M: —/—/— | Lead: — | Proj: —"
+end
+
+-- ===== Mobile controls + desktop hotkeys =====
+local function lockTargetFromBox()
+    if input.Text=="" then
+        status.TextColor3=Color3.fromRGB(255,190,90)
+        status.Text="Type a target username/display name first."
+        return
+    end
+    local found=findPlayerByPartial(input.Text)
+    if found then
+        targetName=found.Name
+        input.Text=found.Name
+        local p=getProfile(found)
+        status.TextColor3=Color3.fromRGB(120,255,120)
+        status.Text=string.format("Target locked: %s | hits C/P %d/%d",found.Name,p.confirmedHits,p.probableHits)
+    else
+        status.TextColor3=Color3.fromRGB(255,110,110)
+        status.Text="No player matched that name."
+    end
+end
+
+local function toggleAuto()
+    if targetName=="" then
+        status.TextColor3=Color3.fromRGB(255,190,90)
+        status.Text="Set and LOCK a target first."
+        autoFire=false
+        updateAutoButton()
+        return
+    end
+
+    autoFire=not autoFire
+    if autoFire then
+        startAuto()
+        status.TextColor3=Color3.fromRGB(120,255,120)
+        status.Text="AUTO ENABLED - "..targetName.."\nLearning movement before first 1.50s shot"
+    else
+        stopAuto()
+        status.TextColor3=Color3.fromRGB(255,190,90)
+        status.Text="AUTO DISABLED"
+    end
+    updateAutoButton()
+end
+
+local function cycleBodyPart()
+    currentBodyPartIndex=(currentBodyPartIndex%#BODY_PARTS)+1
+    updatePartLabel()
+    status.TextColor3=Color3.fromRGB(120,255,120)
+    status.Text="Aiming at: "..BODY_PARTS[currentBodyPartIndex].name
+end
+
+local destroyed=false
+local function destroyScript()
+    if destroyed then return end
+    destroyed=true
+    autoFire=false
+    stopAuto()
+
+    for _,key in ipairs({"InputConn","ProjectileConn","DragConn","DamageConn","MainRemoteConn"}) do
+        if STATE[key] then
+            pcall(function() STATE[key]:Disconnect() end)
+            STATE[key]=nil
+        end
+    end
+    if gui then gui:Destroy() end
+    _G.FireballAdaptiveV4=nil
+    print("[AdaptiveFireball-V4] Destroyed.")
+end
+
+miniToggle.Activated:Connect(function() frame.Visible=not frame.Visible end)
+closeX.Activated:Connect(function() frame.Visible=false end)
+hideButton.Activated:Connect(function() frame.Visible=false end)
+lockButton.Activated:Connect(lockTargetFromBox)
+input.FocusLost:Connect(function(enterPressed) if enterPressed then lockTargetFromBox() end end)
+autoButton.Activated:Connect(toggleAuto)
+bodyButton.Activated:Connect(cycleBodyPart)
+destroyButton.Activated:Connect(destroyScript)
+
+local keyLock={f4=false,v=false,n=false,f10=false}
+STATE.InputConn=UserInputService.InputBegan:Connect(function(inp,processed)
+    if processed then return end
+    local kc=inp.KeyCode
+    if kc==Enum.KeyCode.F4 and not keyLock.f4 then
+        keyLock.f4=true frame.Visible=not frame.Visible
+        task.delay(0.20,function() keyLock.f4=false end) return
+    end
+    if kc==Enum.KeyCode.F10 and not keyLock.f10 then
+        keyLock.f10=true destroyScript() return
+    end
+    if kc==Enum.KeyCode.Return and frame.Visible then lockTargetFromBox() return end
+    if kc==Enum.KeyCode.V and not keyLock.v then
+        keyLock.v=true toggleAuto() task.delay(0.18,function() keyLock.v=false end) return
+    end
+    if kc==Enum.KeyCode.N and not keyLock.n then
+        keyLock.n=true cycleBodyPart() task.delay(0.18,function() keyLock.n=false end) return
+    end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(1)
+    if autoFire and targetName~="" then startAuto() end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    profiles[player.UserId]=nil
+    if player.Name==targetName then
+        autoFire=false
+        stopAuto()
+        updateAutoButton()
+    end
+end)
+
+print("[AdaptiveFireball-V4] Loaded: multi-model ground/juke/turn/circle/orbit/jump/flight predictor.")
+print("[AdaptiveFireball-V4] Correct RTT ping + jitter compensation + exactly 1.50s fire interval.")
+print("[AdaptiveFireball-V4] DamageIndicatorEvent is passive observation only; ambiguous fist/fireball events are NOT treated as confirmed hits.")
+print(string.format("[AdaptiveFireball-V4] Projectile model seed %.1f; live projectiles self-calibrate when detectable.",projectileSpeedModel))
